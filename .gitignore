@@ -1,0 +1,30 @@
+# Prerequisites
+*.d
+
+# GCC files
+*.o
+*.obj
+*.su
+*.expand
+*.sym
+
+# Linker output
+
+*.map
+
+# Executables
+*.bin
+*.elf
+*.out
+*.hex
+
+*bootloader 
+
+# linux 
+*:Zone.Identifier 
+
+#unwanted
+*makefile
+info.md
+*.makefile
+*.img
