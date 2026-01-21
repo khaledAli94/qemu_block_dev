@@ -1,0 +1,3 @@
+sdhc.c:12:5:sd_send_cmd	40	static
+sdhc.c:53:6:sd_init	16	static
+sdhc.c:99:6:sd_read_sector	24	static
