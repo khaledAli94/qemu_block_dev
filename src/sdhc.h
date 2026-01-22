@@ -89,9 +89,11 @@
 void sd_init();
 int sd_send_cmd(int cmd, uint32_t arg, int resp);
 void sd_read_sector(uint32_t sector, uint8_t *buffer);
-void sd_write_sector(uint32_t sector, const uint8_t *buffer);
-int sd_erase_sector(uint32_t start_sector, uint32_t end_sector);
-
 int sd_read_multiple_sectors(uint32_t sector, uint32_t count, uint8_t *buffer);
+
+void sd_write_sector(uint32_t sector, const uint8_t *buffer);
+int sd_write_multiple_sectors(uint32_t start_sector, uint32_t count, const uint8_t *buffer);
+
+int sd_erase_sector(uint32_t start_sector, uint32_t end_sector);
 
 #endif

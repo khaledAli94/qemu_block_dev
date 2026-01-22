@@ -26,6 +26,8 @@
 #unwanted
 *makefile
 info.md
+*.h_
+*.c_
 *.makefile
 *.img
 *.vscode
