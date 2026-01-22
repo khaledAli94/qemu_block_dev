@@ -25,6 +25,10 @@ void *memset(void *dst, int c, size_t n) {
     return dst;
 }
 
+int raise(int sig){
+    return 0;
+}
+
 void main() {
     /* just test xfer */
     // sd_read_sector(0, buffer);

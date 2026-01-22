@@ -47,7 +47,7 @@ void sd_init() {
     // 6. CMD3: Send Relative Address (Ask card to publish a new RCA)
     sd_send_cmd(3, 0, 1);
     rca = MMCI_RESP0 & 0xFFFF0000; // Save the RCA
-    printf("RCA received: %x\n", rca);
+    printf("RCA received: 0x%x\n", rca);
 
     // 7. CMD7: Select Card (Move to Transfer State)
     sd_send_cmd(7, rca, 1);

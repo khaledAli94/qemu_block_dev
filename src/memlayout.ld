@@ -8,7 +8,8 @@ MEMORY
        so the end doesn't go off the cliff.
        128MB - 64KB = 128M - 65536
     */
-    RAM (rwx) : ORIGIN = 0x60010000, LENGTH = 128M - 64K
+    /* RAM (rwx) : ORIGIN = 0x60010000, LENGTH = 128M - 64K */
+    RAM (xrw) : ORIGIN = 0x60000000, LENGTH = 128M
 }
 
 SECTIONS
