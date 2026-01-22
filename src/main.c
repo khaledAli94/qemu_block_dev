@@ -3,7 +3,7 @@
 #include <stddef.h> 
 
 uint8_t buffer[512];
-uint8_t write_buffer[512];
+// uint8_t multi_buffer[2*512];
 
 void *memcpy(void *dst, const void *src, size_t n)
 {
@@ -28,6 +28,7 @@ void main() {
     /* just test xfer */
     // sd_read_sector(0, buffer);
     // sd_read_sector(2048, buffer);
+    // sd_read_multiple_sectors(2048,2,multi_buffer);
 
 
     /* Read Sector 0 (First 512 bytes of sdcard.img MBR) */ 

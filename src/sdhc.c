@@ -271,3 +271,92 @@ void sd_write_sector(uint32_t sector, const uint8_t *buffer) {
         uart_print("Could not verify write status\n");
     }
 }
+
+
+int sd_read_multiple_sectors(uint32_t sector, uint32_t count, uint8_t *buffer) {
+    if (count == 0) {
+        uart_print("Error: count must be > 0\n");
+        return -1;
+    }
+    
+    uart_print("Multi-read: ");
+    uart_print_hex(count);
+    uart_print(" sectors from ");
+    uart_print_hex(sector);
+    uart_print("\n");
+    
+    // Setup data transfer parameters
+    MMCI_DATALEN = 512 * count;        // Total bytes to transfer
+    MMCI_DATATIMER = 0xFFFFF;          // Timeout value
+    // Enable (1), Direction:Rx (2), BlockSize:512 (9<<4), BlockMode (1<<10)
+    MMCI_DATACTRL = 0x493;
+    
+    // Clear any previous status
+    MMCI_CLEAR = 0xFFFFFFFF;
+    
+    // 1. Send CMD18 (Read Multiple Block)
+    if (sd_send_cmd(18, sector * 512, 1) != 0) {
+        uart_print("Error: CMD18 failed\n");
+        return -1;
+    }
+    
+    uart_print("Reading data");
+    
+    // 2. Read all data
+    uint32_t bytes_read = 0;
+    uint32_t total_bytes = 512 * count;
+    int timeout = 1000000;  // Timeout counter
+    
+    while (bytes_read < total_bytes) {
+        if (timeout-- <= 0) {
+            uart_print("\nError: Read timeout\n");
+            
+            // Try to send stop command before returning
+            sd_send_cmd(12, 0, 1);
+            MMCI_CLEAR = 0xFFFFFFFF;
+            return -1;
+        }
+        
+        // Check if data is available in FIFO
+        if (MMCI_STATUS & STAT_RX_DATA_AVAIL) {
+            uint32_t data = MMCI_FIFO;
+            
+            // Store 4 bytes
+            if (bytes_read + 4 <= total_bytes) {
+                *(uint32_t *)(buffer + bytes_read) = data;
+                bytes_read += 4;
+            } else {
+                // Handle last partial word
+                uint8_t *src = (uint8_t *)&data;
+                for (int i = 0; i < 4 && bytes_read < total_bytes; i++) {
+                    buffer[bytes_read++] = src[i];
+                }
+            }
+        }
+    }
+    
+    uart_print("\nRead ");
+    uart_print_hex(bytes_read);
+    uart_print(" bytes\n");
+    
+    // 3. Wait for data transfer completion
+    timeout = 100000;
+    while (timeout--) {
+        if (MMCI_STATUS & STAT_DATA_BLOCK_END) {
+            break;
+        }
+    }
+    
+    // 4. Send CMD12 to stop multiple block transfer
+    if (sd_send_cmd(12, 0, 1) != 0) {
+        uart_print("Warning: CMD12 failed\n");
+    } else {
+        uart_print("OK\n");
+    }
+    
+    // 5. Clear all status flags
+    MMCI_CLEAR = 0xFFFFFFFF;
+    
+    uart_print("Multiple read completed\n");
+    return 0;
+}
