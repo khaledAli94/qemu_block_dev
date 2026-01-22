@@ -36,7 +36,7 @@ void main() {
         p[i] = 0xDEADBEEF;
     }
 
-    sd_write_multiple_sectors(2048, 2, multi_buffer);
+    // sd_write_multiple_sectors(2048, 2, multi_buffer);
     sd_read_multiple_sectors(2048,2,read_buffer);
 
     /* Read Sector 0 (First 512 bytes of sdcard.img MBR) */ 
@@ -47,8 +47,7 @@ void main() {
     // Read the FAT32 Boot Sector
     sd_read_sector(partition_start, buffer);
 
-    /*  
-    * Field	                Offset	Size
+    /* * Field	                Offset	Size
     * bytes_per_sector	    11 0xb	2
     * sectors_per_cluster   13 0xd	1
     * reserved_sectors	    14 0xe	2
@@ -74,9 +73,7 @@ void main() {
     /* Read the first sector of the root directory */
     sd_read_sector(root_lba, buffer);
 
-
-
-    /*  parse dir entries in root (single cluster for now) */
+    /* parse dir entries in root (single cluster for now) */
     int entries_per_sector = bytes_per_sector / 32;
 
     for (int i = 0; i < entries_per_sector; i++) {
@@ -106,14 +103,8 @@ void main() {
 
         /* Extract file size */
         uint32_t file_size = *(uint32_t*)(&entry[0x1C]);
+        printf("FILE: %s CLUSTER: %x SIZE: %x\n", name, first_cluster, file_size);
 
-        uart_print("FILE: ");
-        uart_print(name);
-        uart_print("  CLUSTER: ");
-        uart_print_hex(first_cluster);
-        uart_print("  SIZE: ");
-        uart_print_hex(file_size);
-        uart_print("\n");
 
         if (first_cluster == 0)
             continue;   // skip weird entries
@@ -132,11 +123,11 @@ void main() {
             /* dump up to 512 bytes (or remaining) */
             uint32_t to_print = remaining > 512 ? 512 : remaining;
 
-            uart_print("DATA: ");
+            printf("DATA: ");
             for (uint32_t k = 0; k < to_print; k++) {
                 uart_putc(buffer[k]);
             }
-            uart_print("\n");
+            printf("\n");
 
             if (remaining <= 512)
                 break;
@@ -160,9 +151,6 @@ void main() {
 
             current_cluster = next_cluster;
         }    
-
-
-   
     }
 
     while (1);
