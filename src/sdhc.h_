@@ -27,39 +27,17 @@
 #define CMD17  17  // READ_SINGLE_BLOCK
 #define CMD18  18  // READ_MULTIPLE_BLOCK
 #define CMD24  24  // WRITE_SINGLE_BLOCK
-#define CMD25  25  // WRITE_MULTIPLE_BLOCK
-#define CMD38  38  // ERASE (for SD erase command)
 #define CMD55  55  // APP_CMD
 #define ACMD41 41  // SD_SEND_OP_COND
 
-// Status bits (from PL181 specification)
-#define STAT_CMD_CRC_FAIL      (1 << 0)
-#define STAT_DATA_CRC_FAIL     (1 << 1)
-#define STAT_CMD_TIMEOUT       (1 << 2)
-#define STAT_DATA_TIMEOUT      (1 << 3)
-#define STAT_TX_UNDERRUN       (1 << 4)
-#define STAT_RX_OVERRUN        (1 << 5)
-#define STAT_CMD_RESP_END      (1 << 6)
-#define STAT_CMD_SENT          (1 << 7)
-#define STAT_DATA_END          (1 << 8)
-#define STAT_START_BIT_ERR     (1 << 9)
-#define STAT_DATA_BLOCK_END    (1 << 10)  // This is the correct one
-#define STAT_CMD_ACTIVE        (1 << 11)
-#define STAT_TX_ACTIVE         (1 << 12)
-#define STAT_RX_ACTIVE         (1 << 13)
-#define STAT_TX_FIFO_HALF_EMPTY (1 << 14)  // TX FIFO half empty
-#define STAT_RX_FIFO_HALF_FULL  (1 << 15)  // RX FIFO half full
-#define STAT_TX_FIFO_FULL       (1 << 16)
-#define STAT_RX_FIFO_FULL       (1 << 17)
-#define STAT_TX_FIFO_EMPTY      (1 << 18)
-#define STAT_RX_FIFO_EMPTY      (1 << 19)
-#define STAT_TX_DATA_AVAIL      (1 << 20)
-#define STAT_RX_DATA_AVAIL      (1 << 21)
-
-// Legacy/compatibility definitions 
-// (using the actual bit definitions from above)
-#define STAT_TX_FIFO_HALF       STAT_TX_FIFO_HALF_EMPTY
-#define STAT_RX_FIFO_HALF       STAT_RX_FIFO_HALF_FULL
+// Status bits
+#define STAT_CMD_TIMEOUT    (1 << 2)
+#define STAT_DATA_TIMEOUT   (1 << 3)
+#define STAT_DATA_BLOCK_END (1 << 4)
+#define STAT_CMD_SENT       (1 << 7)
+#define STAT_CMD_RESP_END   (1 << 6)
+#define STAT_RX_FIFO_HALF   (1 << 5)
+#define STAT_TX_FIFO_HALF   (1 << 4)
 
 // QEMU-specific: SD card in VExpress-A9 is usually 64MB (131072 blocks of 512 bytes)
 #define SD_BLOCK_SIZE   512
@@ -69,6 +47,4 @@
 void sd_init();
 int sd_send_cmd(int cmd, uint32_t arg, int resp);
 void sd_read_sector(uint32_t sector, uint8_t *buffer);
-void sd_write_sector(uint32_t sector, const uint8_t *buffer);
-int sd_erase_sector(uint32_t start_sector, uint32_t end_sector);
 #endif

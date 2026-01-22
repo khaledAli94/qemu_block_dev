@@ -1,18 +1,36 @@
 #include <uart.h>
 #include <sdhc.h>
-
+#include <stddef.h> 
 
 uint8_t buffer[512];
+uint8_t write_buffer[512];
+
+void *memcpy(void *dst, const void *src, size_t n)
+{
+    uint8_t *d = dst;
+    const uint8_t *s = src;
+
+    while (n--)
+        *d++ = *s++;
+
+    return dst;
+}
+
+void *memset(void *dst, int c, size_t n) {
+    unsigned char *p = dst;
+    while (n--) {
+        *p++ = (unsigned char)c;
+    }
+    return dst;
+}
 
 void main() {
     /* just test xfer */
-    // Read Sector 0 (First 512 bytes of sdcard.img MBR)
-    sd_read_sector(0, buffer);
-    sd_read_sector(2048, buffer);
-    
+    // sd_read_sector(0, buffer);
+    // sd_read_sector(2048, buffer);
 
 
-    /* actual logic starts by manually assemble little‑endian values */
+    /* Read Sector 0 (First 512 bytes of sdcard.img MBR) */ 
     sd_read_sector(0, buffer);
     // Partition start LBA
     uint32_t partition_start = *(uint32_t*)(&buffer[0x1be + 8]); //454 assume little endian
@@ -22,12 +40,13 @@ void main() {
 
     /*  
     * Field	                Offset	Size
-    * bytes_per_sector	    0x0B	2
-    * sectors_per_cluster   0x0D	1
-    * reserved_sectors	    0x0E	2
-    * number_of_fats        0x10	1
-    * fat_size_32	        0x24	4
-    * root_cluster	        0x2C	4
+    * bytes_per_sector	    11 0xb	2
+    * sectors_per_cluster   13 0xd	1
+    * reserved_sectors	    14 0xe	2
+    * number_of_fats        16 0x10	1
+    * fat_size_32	        36 0x24	4
+    * root_cluster	        44 0x2C	4
+    * litte endian reads pointed type then puts at LSB
     */
     uint16_t bytes_per_sector   = *(uint16_t*)(&buffer[0x0B]);
     uint8_t  sectors_per_cluster = buffer[0x0D];

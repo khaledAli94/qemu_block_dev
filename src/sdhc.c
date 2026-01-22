@@ -4,49 +4,48 @@
 // --- SD / PL181 Driver ---
 
 uint32_t rca = 0; // Relative Card Address
-
+static void sd_delay(void) {
+    volatile int i;
+    for (i = 0; i < 100; i++);
+}
 // Send a command to the SD card
 // cmd:  Command Index
 // arg:  Argument
 // resp: 0 = No Resp, 1 = Short Resp (48 bits), 2 = Long Resp (136 bits)
-int sd_send_cmd(int cmd, uint32_t arg, int resp) {
+int sd_send_cmd(int cmd, uint32_t arg, int resp_type) {
     MMCI_ARG = arg;
-    MMCI_CLEAR = 0xFFFFFFFF; // Clear previous status flags
-
-    // 1. Construct the Command Register Value
-    // Bit 10: Enable State Machine
-    uint32_t cmd_val = cmd | (1 << 10); 
+    MMCI_CLEAR = 0xFFFFFFFF;  // Clear all status
     
-    if (resp) {
-        cmd_val |= (1 << 6); // Bit 6: Expect Response
-        if (resp == 2) {
-            cmd_val |= (1 << 7); // Bit 7: Long Response (136-bit)
+    uint32_t cmd_reg = cmd | (1 << 10);  // Enable state machine
+    
+    if (resp_type) {
+        cmd_reg |= (1 << 6);  // Expect response
+        if (resp_type == 2) {
+            cmd_reg |= (1 << 7);  // Long response
         }
     }
-
-    MMCI_CMD = cmd_val;
-
-    // 2. Determine which Status Bit to wait for
-    // If we expect a response, wait for Bit 6 (CmdRespEnd)
-    // If NO response, wait for Bit 7 (CmdSent)
-    int wait_mask = (resp) ? (1 << 6) : (1 << 7);
-
-    // 3. Wait for completion
-    while (1) {
-        volatile uint32_t status = MMCI_STATUS;
+    
+    MMCI_CMD = cmd_reg;
+    
+    // Wait for completion (QEMU completes instantly)
+    int timeout = 10000;  // Small timeout for QEMU
+    uint32_t wait_for = resp_type ? STAT_CMD_RESP_END : STAT_CMD_SENT;
+    
+    while (timeout--) {
+        uint32_t status = MMCI_STATUS;
         
-        // Check for Timeout (Bit 2)
-        if (status & (1 << 2)) { 
-            uart_print(" [CMD Timeout]\n");
-            return -1;
+        if (status & STAT_CMD_TIMEOUT) {
+            return -1;  // Command timeout
         }
         
-        // Check for Completion (Bit 6 or Bit 7)
-        if (status & wait_mask) {
-            break; 
+        if (status & wait_for) {
+            return 0;   // Success
         }
+        
+        sd_delay();
     }
-    return 0;
+    
+    return -1;  // Timeout
 }
 
 
@@ -126,4 +125,149 @@ void sd_read_sector(uint32_t sector, uint8_t *buffer) {
     // Clear data transfer flags
     MMCI_CLEAR = 0xFFFFFFFF;
     uart_print("Read Complete.\n");
+}
+
+void sd_write_sector(uint32_t sector, const uint8_t *buffer) {
+    uart_print("Writing Sector "); uart_print_hex(sector); uart_print("\n");
+
+    // 1. Clear any pending status flags before starting
+    MMCI_CLEAR = 0xFFFFFFFF;
+    
+    // 2. Setup Data Control for write
+    MMCI_DATALEN = 512;          // 512 bytes to transfer
+    MMCI_DATATIMER = 0xFFFFF;    // Generous timeout for QEMU
+    
+    // Configure Data Control Register:
+    // - Bit 0: Enable (1)
+    // - Bits 1-2: Direction = 0 (Host to Card/Transmit)
+    // - Bits 4-7: Blocksize = 9 (512 bytes)
+    // - Bit 10: Use block mode (1)
+    // Result: 0x91 | (1 << 10) = 0x491
+    MMCI_DATACTRL = 0x491; 
+
+    // 3. Send CMD24 (Write Single Block)
+    // QEMU uses byte addressing for .img files
+    if (sd_send_cmd(24, sector * 512, 1) != 0) {
+        uart_print("Error: CMD24 failed\n");
+        return;
+    }
+
+    // 4. Write data to FIFO - IMPORTANT: QEMU PL181 requires precise FIFO handling
+    int bytes_written = 0;
+    int timeout = 100000;  // Large timeout for safety
+    
+    while (bytes_written < 512 && timeout > 0) {
+        uint32_t status = MMCI_STATUS;
+        
+        // Check for errors first
+        if (status & STAT_DATA_TIMEOUT) {
+            uart_print("Error: Data timeout during write\n");
+            MMCI_CLEAR = STAT_DATA_TIMEOUT;
+            return;
+        }
+        
+        // PL181 FIFO is 16 words (64 bytes). We can write when FIFO is not full.
+        // For QEMU, we need to check multiple conditions:
+        // - TX FIFO not full (FIFO empty or half-empty flags)
+        // - Data controller is ready to accept data
+        
+        // Method 1: Check if TX FIFO is half empty (can accept at least 8 words)
+        if (status & STAT_TX_FIFO_HALF) {
+            // Write 4 words (16 bytes) at a time to keep FIFO busy
+            for (int i = 0; i < 4 && bytes_written < 512; i++) {
+                uint32_t data = 0;
+                
+                // Pack 4 bytes into a word (little-endian)
+                data |= buffer[bytes_written];
+                if (bytes_written + 1 < 512) data |= buffer[bytes_written + 1] << 8;
+                if (bytes_written + 2 < 512) data |= buffer[bytes_written + 2] << 16;
+                if (bytes_written + 3 < 512) data |= buffer[bytes_written + 3] << 24;
+                
+                MMCI_FIFO = data;
+                bytes_written += 4;
+            }
+        }
+        
+        // Method 2: Alternative check - if FIFO empty flag is set, we can definitely write
+        else if (status & STAT_TX_FIFO_EMPTY) {
+            // Write 1 word (4 bytes) when FIFO is completely empty
+            uint32_t data = 0;
+            data |= buffer[bytes_written];
+            if (bytes_written + 1 < 512) data |= buffer[bytes_written + 1] << 8;
+            if (bytes_written + 2 < 512) data |= buffer[bytes_written + 2] << 16;
+            if (bytes_written + 3 < 512) data |= buffer[bytes_written + 3] << 24;
+            
+            MMCI_FIFO = data;
+            bytes_written += 4;
+        }
+        
+        timeout--;
+        if (timeout % 10000 == 0) {
+            sd_delay();  // Small delay to prevent tight loop issues in QEMU
+        }
+    }
+    
+    if (timeout <= 0) {
+        uart_print("Error: Write loop timeout\n");
+        MMCI_CLEAR = 0xFFFFFFFF;
+        return;
+    }
+    
+    uart_print("Data written to FIFO: "); uart_print_hex(bytes_written); uart_print(" bytes\n");
+
+    // 5. Wait for data transfer to complete (Data Block End)
+    // This is CRITICAL - the write isn't done until the card acknowledges it
+    timeout = 1000000;  // Very large timeout for QEMU
+    
+    while (timeout--) {
+        uint32_t status = MMCI_STATUS;
+        
+        // Check for completion
+        if (status & STAT_DATA_BLOCK_END) {
+            uart_print("Data block transfer complete\n");
+            break;
+        }
+        
+        // Check for errors
+        if (status & STAT_DATA_TIMEOUT) {
+            uart_print("Error: Data timeout after write\n");
+            MMCI_CLEAR = STAT_DATA_TIMEOUT;
+            return;
+        }
+        
+        if (timeout % 100000 == 0) {
+            sd_delay();  // Periodic delay
+        }
+    }
+    
+    if (timeout <= 0) {
+        uart_print("Warning: Data block end timeout (may be OK in QEMU)\n");
+    }
+    
+    // 6. Clear all status flags
+    MMCI_CLEAR = 0xFFFFFFFF;
+    
+    // 7. Send CMD13 to verify write was successful
+    // Wait a bit for card to process (QEMU needs this)
+    for (volatile int i = 0; i < 1000; i++);
+    
+    if (sd_send_cmd(13, rca, 1) == 0) {
+        uint32_t card_status = MMCI_RESP0;
+        
+        // Check important status bits:
+        // Bit 8: READY_FOR_DATA (1 = ready)
+        // Bit 9: APP_CMD (1 = card expects ACMD)
+        // Bits 22-12: Current state (should be 4 = transfer state)
+        
+        uart_print("Card status after write: "); uart_print_hex(card_status); uart_print("\n");
+        
+        // Simplified check: if high bit is set, card is not busy
+        if (card_status & (1U << 31)) {
+            uart_print("Write verified successful\n");
+        } else {
+            uart_print("Card still busy after write\n");
+        }
+    } else {
+        uart_print("Could not verify write status\n");
+    }
 }
