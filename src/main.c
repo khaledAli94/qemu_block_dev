@@ -1,9 +1,9 @@
 #include <uart.h>
 #include <sdhc.h>
 #include <stddef.h> 
+#include <fat32.h> 
 
 uint8_t buffer[512];
-uint8_t multi_buffer[2*512];
 uint8_t read_buffer[2*512];
 
 void *memcpy(void *dst, const void *src, size_t n)
@@ -28,23 +28,25 @@ void *memset(void *dst, int c, size_t n) {
 int raise(int sig){
     return 0;
 }
+/* 
+Bytes 0 – 445: Bootstrap Code Area. This area is variable. It contains machine code (assembly) to boot the CPU. You must never read data from here as if it were a struct.
 
+Bytes 446 – 509: Partition Table. This is the "Data Area." It contains exactly 4 slots of 16 bytes each.
+Partition 1: 446 (0x1BE)
+Partition 2: 462 (0x1CE)
+Partition 3: 478 (0x1DE)
+Partition 4: 494 (0x1EE)
+Bytes 510 – 511: Boot Signature. Always 0x55, 0xAA.
+*/
 void main() {
     /* just test xfer */
     // sd_read_sector(0, buffer);
     // sd_read_sector(2048, buffer);
     // sd_read_multiple_sectors(2048,2,multi_buffer);
 
-    uint32_t *p = (uint32_t *)multi_buffer;
-    for (size_t i = 0; i < (sizeof(multi_buffer) / 4); i++) {
-        p[i] = 0xDEADBEEF;
-    }
-
-    // sd_write_multiple_sectors(2048, 2, multi_buffer);
-    sd_read_multiple_sectors(2048,2,read_buffer);
-
     /* Read Sector 0 (First 512 bytes of sdcard.img MBR) */ 
     sd_read_sector(0, buffer);
+
     // Partition start LBA
     uint32_t partition_start = *(uint32_t*)(&buffer[0x1be + 8]); //454 assume little endian
     
