@@ -1,0 +1,71 @@
+#include "uart.h" 
+#include "sdhc.h"
+#include <string.h> // memcpy
+
+// Align buffer to prevent ARM data aborts during FIFO access
+uint8_t buffer[512] __attribute__((aligned(4)));
+
+void main() {
+
+    // 1. Read MBR (Sector 0)
+    if (!sd_read_block(0, buffer)) {
+        printf("MBR Read OK.\n");
+
+        // Use memcpy to read unaligned data safely
+        uint32_t partition_start;
+        memcpy(&partition_start, &buffer[0x1be + 8], 4);
+        
+        printf("Partition Start LBA: %u\n", partition_start);
+
+        // 3. Read Boot Sector
+        if (sd_read_block(partition_start, buffer) == 0) {
+            printf("Boot Sector Read OK.\n");
+
+            // Extract FAT32 info safely
+            uint16_t bytes_per_sec;
+            uint32_t root_cluster;
+            uint16_t rsvd_secs;
+            uint32_t fat_sz;
+            uint8_t num_fats = buffer[0x10];
+            uint8_t sec_per_cl = buffer[0x0D];
+
+            memcpy(&bytes_per_sec, &buffer[0x0B], 2);
+            memcpy(&rsvd_secs,     &buffer[0x0E], 2);
+            memcpy(&fat_sz,        &buffer[0x24], 4);
+            memcpy(&root_cluster,  &buffer[0x2C], 4);
+
+            printf("Root Cluster: %u\n", root_cluster);
+
+            uint32_t fat_start = partition_start + rsvd_secs;
+            uint32_t data_start = fat_start + (fat_sz * num_fats);
+            uint32_t root_lba = data_start + (root_cluster - 2) * sec_per_cl;
+
+            printf("Root Dir LBA: %u\n", root_lba);
+
+            // 4. Read Root Directory
+            if (sd_read_block(root_lba, buffer) == 0) {
+                printf("Root Dir Read OK. Parsing...\n");
+                
+                int entries = bytes_per_sec / 32;
+                for (int i = 0; i < entries; i++) {
+                    uint8_t *entry = &buffer[i * 32];
+                    if (entry[0] == 0) break; 
+                    if (entry[0] == 0xE5) continue;
+                    
+                    char name[12];
+                    memcpy(name, entry, 11);
+                    name[11] = 0;
+                    printf("File: %s\n", name);
+                }
+
+            } else {
+                printf("Root Dir Read Failed.\n");
+            }
+        } else {
+            printf("Boot Sector Read Failed.\n");
+        }
+    } else {
+        printf("MBR Read Failed. Error Code: %d\n");
+    }
+
+}
