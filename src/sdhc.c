@@ -1,510 +1,379 @@
-#include <sdhc.h>
-#include <uart.h>
+#include "sdhc.h"
 
-// --- SD / PL181 Driver ---
+// implmentation 1-bit mode at Low Speed (400kHz)
+static uint32_t rca = 0;             // Relative Card Address
+static int is_high_capacity = 0;     // 0 = SDSC (Byte Addr), 1 = SDHC/SDXC (Block Addr)
 
-uint32_t rca = 0; // Relative Card Address
-static void sd_delay(void) {
-    volatile int i;
-    for (i = 0; i < 100; i++);
+// --- Internal Helpers ---
+static void delay_cycles(volatile int cycles) {
+    while(cycles--) __asm__("nop");
 }
 
-void sd_init() {
-    printf("Initializing SD Card...\n");
+static int sd_update_clock(void) {
+    H3_SD_MMC0->CMDR = CMD_START | CMD_UP_CLK | CMD_WAIT_PRE;
+    int timeout = 100000;
+    while ((H3_SD_MMC0->CMDR & CMD_START) && timeout--);
+    return (timeout > 0) ? 0 : -1;
+}
 
-    // 1. Power On
-    MMCI_POWER = 0x86; // Power up
-    MMCI_CLOCK = 0x1FF; // Enable clock, slow speed
+static int sd_send_cmd(uint32_t cmd, uint32_t arg, uint32_t flags) {
+    H3_SD_MMC0->RISR = 0xFFFFFFFF; // Clear interrupts
+    H3_SD_MMC0->CAGR = arg;
+    H3_SD_MMC0->CMDR = (cmd & 0x3F) | flags | CMD_START;
 
-    // 2. CMD0: Go Idle State
-    sd_send_cmd(0, 0, 0);
-
-    // 3. CMD8: Send Interface Condition (Check voltage)
-    // 0x1AA = 2.7-3.6V, Check Pattern 0xAA
-    sd_send_cmd(8, 0x1AA, 1);
-    if ((MMCI_RESP0 & 0xFF) != 0xAA) {
-        printf("Error: CMD8 Failed\n");
-        return;
+    int timeout = 1000000;
+    while (timeout--) {
+        uint32_t risr = H3_SD_MMC0->RISR;
+        if (risr & RISR_ERRORS) {
+            return -1; 
+        }
+        if (risr & RISR_CMD_DONE) {
+            H3_SD_MMC0->RISR = RISR_CMD_DONE;
+            return 0; 
+        }
     }
+    return -2; // Timeout
+}
 
-    // 4. ACMD41 Loop (Send Op Cond)
-    // We must poll this until the card is ready (Bit 31 set)
+int sd_init(void) {
+    // 1. Reset & Setup
+    H3_SD_MMC0->GCTL = GCTL_SOFT_RST | GCTL_FIFO_RST | GCTL_DMA_RST;
+    delay_cycles(1000);
+    H3_SD_MMC0->GCTL = GCTL_HC_EN; // Enable Controller, DMA is OFF by default
+    
+    H3_SD_MMC0->CKCR = (1U << 16) | (1U << 24); 
+    sd_update_clock();
+    
+    // 2. Init Commands
+    if (sd_send_cmd(CMD0, 0, CMD_USE_HOLD) != 0) return -1;
+    
+    // CMD8: voltage check
+    if (sd_send_cmd(CMD8, 0x1AA, CMD_RESP_EXP | CMD_CHECK_CRC) != 0) return -2;
+    if ((H3_SD_MMC0->RESP0 & 0xFF) != 0xAA) return -3;
+
+    // 3. ACMD41 with Capacity Check
     int retries = 1000;
     while (retries--) {
-        sd_send_cmd(55, 0, 1); // CMD55 (App Cmd)
-        // 0x40... means HCS (High Capacity Support), 0x0030... is voltage window
-        sd_send_cmd(41, 0x40300000, 1); 
+        sd_send_cmd(CMD55, 0, CMD_RESP_EXP | CMD_CHECK_CRC);
         
-        if (MMCI_RESP0 & (1U << 31)) { // Check "Busy" bit (Bit 31)
-            printf("Card Ready!\n");
-            break;
-        }
-    }
-
-    // 5. CMD2: All Send CID (Get Card ID) - Long Response
-    sd_send_cmd(2, 0, 2);
-
-    // 6. CMD3: Send Relative Address (Ask card to publish a new RCA)
-    sd_send_cmd(3, 0, 1);
-    rca = MMCI_RESP0 & 0xFFFF0000; // Save the RCA
-    printf("RCA received: 0x%x\n", rca);
-
-    // 7. CMD7: Select Card (Move to Transfer State)
-    sd_send_cmd(7, rca, 1);
-    
-    printf("SD Card Initialized.\n");
-}
-
-// Send a command to the SD card
-int sd_send_cmd(int cmd, uint32_t arg, int resp_type) {
-    MMCI_ARG = arg;
-    MMCI_CLEAR = 0xFFFFFFFF;  // Clear all status
-    
-    uint32_t cmd_reg = cmd | (1 << 10);  // Enable state machine
-    
-    if (resp_type) {
-        cmd_reg |= (1 << 6);  // Expect response
-        if (resp_type == 2) {
-            cmd_reg |= (1 << 7);  // Long response
-        }
-    }
-    
-    MMCI_CMD = cmd_reg;
-    
-    // Wait for completion (QEMU completes instantly)
-    int timeout = 10000;  // Small timeout for QEMU
-    uint32_t wait_for = resp_type ? STAT_CMD_RESP_END : STAT_CMD_SENT;
-    
-    while (timeout--) {
-        uint32_t status = MMCI_STATUS;
+        // Arg 0x40... sets HCS (High Capacity Support) bit to 1
+        sd_send_cmd(ACMD41, 0x40FF8000, CMD_RESP_EXP);
         
-        if (status & STAT_CMD_TIMEOUT) {
-            return -1;  // Command timeout
-        }
-        
-        if (status & wait_for) {
-            return 0;   // Success
-        }
-        
-        sd_delay();
-    }
-    
-    return -1;  // Timeout
-}
-
-void sd_read_sector(uint32_t sector, uint8_t *buffer) {
-    printf("Reading Sector %x\n", sector);
-
-    // 1. Setup Data Control
-    MMCI_DATALEN = 512;
-    MMCI_DATATIMER = 0xFFFF;
-    // Enable (1), Direction:Rx (2), BlockSize:512 (9<<4) -> 0x93
-    MMCI_DATACTRL = 0x93; 
-
-    // 2. Send CMD17 (Read Single Block)
-    sd_send_cmd(17, sector * 512, 1);
-
-    // 3. Read Loop
-    int bytes_read = 0;
-    while (bytes_read < 512) {
-        // Wait for Rx FIFO to have data (RxActive or RxHalfFull)
-        if (MMCI_STATUS & (1 << 21)) { 
-            uint32_t data = MMCI_FIFO;
-            *(uint32_t *)(buffer + bytes_read) = data;
-            bytes_read += 4;
-        }
-    }
-    
-    // Clear data transfer flags
-    MMCI_CLEAR = 0xFFFFFFFF;
-    printf("Read Complete.\n");
-}
-
-int sd_read_multiple_sectors(uint32_t sector, uint32_t count, uint8_t *buffer) {
-    if (!count)
-        return -1;
-        
-    printf("Multi-read: %x sectors from %x\n", count, sector);
-    
-    // Setup data transfer parameters
-    MMCI_DATALEN = 512 * count;        // Total bytes to transfer
-    MMCI_DATATIMER = 0xFFFFF;          // Timeout value
-    // Enable (1), Direction:Rx (2), BlockSize:512 (9<<4), BlockMode (1<<10)
-    MMCI_DATACTRL = 0x493;
-    
-    // Clear any previous status
-    MMCI_CLEAR = 0xFFFFFFFF;
-    
-    // 1. Send CMD18 (Read Multiple Block)
-    if (sd_send_cmd(18, sector * 512, 1) != 0) {
-        printf("Error: CMD18 failed\n");
-        return -1;
-    }
-    
-    printf("Reading data");
-    
-    // 2. Read all data
-    uint32_t bytes_read = 0;
-    uint32_t total_bytes = 512 * count;
-    int timeout = 1000000;  // Timeout counter
-    
-    while (bytes_read < total_bytes) {
-        if (timeout-- <= 0) {
-            printf("\nError: Read timeout\n");
-            
-            // Try to send stop command before returning
-            sd_send_cmd(12, 0, 1);
-            MMCI_CLEAR = 0xFFFFFFFF;
-            return -1;
-        }
-        
-        // Check if data is available in FIFO
-        if (MMCI_STATUS & STAT_RX_DATA_AVAIL) {
-            uint32_t data = MMCI_FIFO;
-            
-            // Store 4 bytes
-            if (bytes_read + 4 <= total_bytes) {
-                *(uint32_t *)(buffer + bytes_read) = data;
-                bytes_read += 4;
+        if (H3_SD_MMC0->RESP0 & (1U << 31)) { // Card Ready (Busy bit)
+            // Check CCS bit (Card Capacity Status, Bit 30)
+            // If 1, it's SDHC (Block Addressing). If 0, it's SDSC (Byte Addressing).
+            if (H3_SD_MMC0->RESP0 & (1U << 30)) {
+                is_high_capacity = 1; 
             } else {
-                // Handle last partial word
-                uint8_t *src = (uint8_t *)&data;
-                for (int i = 0; i < 4 && bytes_read < total_bytes; i++) {
-                    buffer[bytes_read++] = src[i];
-                }
+                is_high_capacity = 0;
             }
+            break; 
         }
+        delay_cycles(1000);
     }
+    if (retries <= 0) return -4;
+
+    // 4. Finalize Setup
+    if (sd_send_cmd(CMD2, 0, CMD_RESP_EXP | CMD_LONG_RESP | CMD_CHECK_CRC) != 0) return -5;
+    if (sd_send_cmd(CMD3, 0, CMD_RESP_EXP | CMD_CHECK_CRC) != 0) return -6;
+    rca = H3_SD_MMC0->RESP0 >> 16;
     
-    printf("\nRead %x bytes\n", bytes_read);
+    if (sd_send_cmd(CMD7, rca << 16, CMD_RESP_EXP | CMD_CHECK_CRC) != 0) return -7;
+    if (sd_send_cmd(CMD16, 512, CMD_RESP_EXP | CMD_CHECK_CRC) != 0) return -8; // Set Block Size
     
-    // 3. Wait for data transfer completion
-    timeout = 100000;
-    while (timeout--) {
-        if (MMCI_STATUS & STAT_DATA_BLOCK_END) {
-            break;
-        }
-    }
-    
-    // 4. Send CMD12 to stop multiple block transfer
-    if (sd_send_cmd(12, 0, 1) != 0) {
-        printf("Warning: CMD12 failed\n");
-    } else {
-        printf("OK\n");
-    }
-    
-    // 5. Clear all status flags
-    MMCI_CLEAR = 0xFFFFFFFF;
-    
-    printf("Multiple read completed\n");
     return 0;
 }
 
-void sd_write_sector(uint32_t sector, const uint8_t *buffer) {
-    printf("Writing Sector %x\n", sector);
+int sd_read_block(uint32_t sector, uint8_t *buffer) {
+    H3_SD_MMC0->BKSR = 512;
+    H3_SD_MMC0->BYCR = 512;
 
-    // 1. Clear any pending status flags before starting
-    MMCI_CLEAR = 0xFFFFFFFF;
-    
-    // 2. Setup Data Control for write
-    MMCI_DATALEN = 512;          // 512 bytes to transfer
-    MMCI_DATATIMER = 0xFFFFF;    // Generous timeout for QEMU
-    
-    // Configure Data Control Register
-    MMCI_DATACTRL = 0x491; 
-
-    // 3. Send CMD24 (Write Single Block)
-    if (sd_send_cmd(24, sector * 512, 1) != 0) {
-        printf("Error: CMD24 failed\n");
-        return;
-    }
-
-    // 4. Write data to FIFO
-    int bytes_written = 0;
-    int timeout = 100000;  // Large timeout for safety
-    
-    while (bytes_written < 512 && timeout > 0) {
-        uint32_t status = MMCI_STATUS;
-        
-        // Check for errors first
-        if (status & STAT_DATA_TIMEOUT) {
-            printf("Error: Data timeout during write\n");
-            MMCI_CLEAR = STAT_DATA_TIMEOUT;
-            return;
-        }
-        
-        // Method 1: Check if TX FIFO is half empty
-        if (status & STAT_TX_FIFO_HALF) {
-            for (int i = 0; i < 4 && bytes_written < 512; i++) {
-                uint32_t data = 0;
-                data |= buffer[bytes_written];
-                if (bytes_written + 1 < 512) data |= buffer[bytes_written + 1] << 8;
-                if (bytes_written + 2 < 512) data |= buffer[bytes_written + 2] << 16;
-                if (bytes_written + 3 < 512) data |= buffer[bytes_written + 3] << 24;
-                
-                MMCI_FIFO = data;
-                bytes_written += 4;
-            }
-        }
-        // Method 2: Check if FIFO empty
-        else if (status & STAT_TX_FIFO_EMPTY) {
-            uint32_t data = 0;
-            data |= buffer[bytes_written];
-            if (bytes_written + 1 < 512) data |= buffer[bytes_written + 1] << 8;
-            if (bytes_written + 2 < 512) data |= buffer[bytes_written + 2] << 16;
-            if (bytes_written + 3 < 512) data |= buffer[bytes_written + 3] << 24;
-            
-            MMCI_FIFO = data;
-            bytes_written += 4;
-        }
-        
-        timeout--;
-        if (timeout % 10000 == 0) {
-            sd_delay();
-        }
-    }
-    
-    if (timeout <= 0) {
-        printf("Error: Write loop timeout\n");
-        MMCI_CLEAR = 0xFFFFFFFF;
-        return;
-    }
-    
-    printf("Data written to FIFO: %x bytes\n", bytes_written);
-
-    // 5. Wait for data transfer to complete
-    timeout = 1000000;  // Very large timeout for QEMU
-    
-    while (timeout--) {
-        uint32_t status = MMCI_STATUS;
-        
-        if (status & STAT_DATA_BLOCK_END) {
-            printf("Data block transfer complete\n");
-            break;
-        }
-        
-        if (status & STAT_DATA_TIMEOUT) {
-            printf("Error: Data timeout after write\n");
-            MMCI_CLEAR = STAT_DATA_TIMEOUT;
-            return;
-        }
-        
-        if (timeout % 100000 == 0) {
-            sd_delay();  // Periodic delay
-        }
-    }
-    
-    if (timeout <= 0) {
-        printf("Warning: Data block end timeout (may be OK in QEMU)\n");
-    }
-    
-    // 6. Clear all status flags
-    MMCI_CLEAR = 0xFFFFFFFF;
-    
-    // 7. Send CMD13 to verify write was successful
-    for (volatile int i = 0; i < 1000; i++);
-    
-    if (sd_send_cmd(13, rca, 1) == 0) {
-        uint32_t card_status = MMCI_RESP0;
-        
-        printf("Card status after write: %x\n", card_status);
-        
-        // Simplified check: if high bit is set, card is not busy
-        if (card_status & (1U << 31)) {
-            printf("Write verified successful\n");
-        } else {
-            printf("Card still busy after write\n");
-        }
+    // --- FIX: ADDRESSING MODE ---
+    uint32_t addr;
+    if (is_high_capacity) {
+        addr = sector;        // SDHC/SDXC
     } else {
-        printf("Could not verify write status\n");
+        addr = sector * 512;  // SDSC (Standard QEMU Image)
     }
+
+    // Send Read Command
+    // CMD_WAIT_PRE is important for H3 to ensure previous data is flushed
+    uint32_t flags = CMD_RESP_EXP | CMD_CHECK_CRC | CMD_DATA_EXP | CMD_WAIT_PRE;
+    if (sd_send_cmd(CMD17, addr, flags) != 0) return -1;
+
+    // --- FIX: ROBUST FIFO READ ---
+    uint32_t *buf_u32 = (uint32_t *)buffer;
+    int words_read = 0;
+    int timeout = 0xFFFFF;
+
+    // Loop until we have read all 128 words (512 bytes)
+    while (words_read < 128 && timeout--) {
+        // Check for Errors
+        if (H3_SD_MMC0->RISR & RISR_ERRORS) {
+            return -2; // Hardware Error
+        }
+
+        // Check if FIFO is empty by reading Status Register (STAR)
+        // Bit 2: FIFO Empty
+        if (!(H3_SD_MMC0->STAR & (1U << 2))) { 
+            // FIFO is NOT empty, safe to read
+            buf_u32[words_read++] = H3_SD_MMC0->FIFO;
+        }
+    }
+
+    // Acknowledge Data Transfer Over
+    H3_SD_MMC0->RISR = RISR_DATA_OVER;
+
+    return (timeout > 0) ? 0 : -3;
 }
 
-int sd_write_multiple_sectors(uint32_t start_sector, uint32_t count, const uint8_t *buffer) {
-    if (count == 0) {
-        printf("Error: count must be > 0\n");
-        return -1;
-    }
-    
-    printf("Multi-write: %x sectors to %x\n", count, start_sector);
-    
-    // 1. Clear any pending status flags before starting
-    MMCI_CLEAR = 0xFFFFFFFF;
-    
-    // 2. Setup Data Control for write
-    MMCI_DATALEN = 512 * count;           // Total bytes to transfer
-    MMCI_DATATIMER = 0xFFFFFF;           // Generous timeout for QEMU
-    
-    // Configure Data Control Register for multi-block write:
-    MMCI_DATACTRL = 0x1493;              // 0x93 | (1 << 10) | (1 << 11)
-    
-    // 3. Send CMD25 (Write Multiple Block)
-    if (sd_send_cmd(25, start_sector * 512, 1) != 0) {
-        printf("Error: CMD25 (Write Multiple) failed\n");
-        MMCI_DATACTRL = 0;  // Disable data controller
-        return -1;
-    }
-    
-    printf("Writing data");
-    
-    // 4. Write all data blocks
-    uint32_t total_bytes = 512 * count;
-    uint32_t bytes_written = 0;
-    int timeout = 1000000;
-    int sectors_written = 0;
-    
-    while (sectors_written < count && timeout > 0) {
-        uint32_t status = MMCI_STATUS;
-        
-        // Check for errors
-        if (status & STAT_DATA_TIMEOUT) {
-            printf("\nError: Data timeout during write\n");
-            MMCI_CLEAR = STAT_DATA_TIMEOUT;
-            break;
-        }
-        
-        // Check if FIFO can accept data
-        #ifdef STAT_TX_FIFO_HALF
-        if ((status & STAT_TX_FIFO_HALF) || (status & STAT_TX_FIFO_EMPTY)) {
-        #else
-        if (!(status & STAT_TX_FIFO_FULL)) {
-        #endif
-            // Write one sector at a time (512 bytes)
-            int sector_offset = sectors_written * 512;
-            
-            // Write complete sector in batches
-            for (int word = 0; word < 128; word++) {  // 128 words = 512 bytes
-                // Wait if FIFO becomes full
-                int inner_timeout = 1000;
-                #ifdef STAT_TX_FIFO_HALF
-                while (!(MMCI_STATUS & STAT_TX_FIFO_HALF) && inner_timeout--) {
-                #else
-                while ((MMCI_STATUS & STAT_TX_FIFO_FULL) && inner_timeout--) {
-                #endif
-                    sd_delay();
-                }
-                
-                // Pack 4 bytes into a word
-                uint32_t data = 0;
-                uint32_t byte_offset = sector_offset + (word * 4);
-                
-                // Safely read 4 bytes from buffer
-                for (int i = 0; i < 4; i++) {
-                    if (byte_offset + i < total_bytes) {
-                        data |= buffer[byte_offset + i] << (i * 8);
-                    }
-                }
-                
-                MMCI_FIFO = data;
-                bytes_written += 4;
-            }
-            
-            sectors_written++;
-            
-            // Print progress every few sectors
-            if ((sectors_written % 16) == 0) {
-                printf(".");
-            }
-        }
-        
-        timeout--;
-        if (timeout % 100000 == 0) {
-            sd_delay();
-        }
-    }
-    
-    printf("\nData written: %x bytes, %x sectors\n", bytes_written, sectors_written);
-    
-    if (timeout <= 0) {
-        printf("Error: Write loop timeout\n");
-    }
-    
-    // 5. Wait for all data to be transferred to card
-    timeout = 1000000;
-    printf("Waiting for transfer completion");
-    
-    while (timeout--) {
-        uint32_t status = MMCI_STATUS;
-        
-        // Check for data block end - use whatever is defined
-        #ifdef STAT_DATA_BLOCK_END
-        if (status & STAT_DATA_BLOCK_END) {
-        #elif defined(STAT_DATA_END)
-        if (status & STAT_DATA_END) {
-        #else
-        if (status & (1 << 8)) {
-        #endif
-            printf(" - Data block end\n");
-            break;
-        }
-        
-        if (status & STAT_DATA_TIMEOUT) {
-            printf("\nError: Final data timeout\n");
-            MMCI_CLEAR = STAT_DATA_TIMEOUT;
-            break;
-        }
-        
-        if (timeout % 100000 == 0) {
-            printf(".");
-        }
-    }
-    
-    if (timeout <= 0) {
-        printf("\nWarning: Data block end timeout\n");
-    }
-    
-    // 6. Send stop transmission token (CMD12)
-    printf("Sending stop command...");
-    MMCI_CLEAR = 0xFFFFFFFF;  // Clear before new command
-    
-    // Give card time to process final data
-    for (volatile int i = 0; i < 10000; i++);
-    
-    if (sd_send_cmd(12, 0, 1) != 0) {
-        printf(" Warning: CMD12 failed\n");
+int sd_read_blocks(uint32_t sector, int count, uint8_t *buffer) {
+    if (count <= 0) return -1;
+    if (count == 1) return sd_read_block(sector, buffer); // Fallback optimization
+
+    // 1. Configure Data Transfer Size
+    // BKSR is always 512 for SD cards
+    H3_SD_MMC0->BKSR = 512;
+    // BYCR is the TOTAL number of bytes to transfer
+    H3_SD_MMC0->BYCR = 512 * count;
+
+    // 2. Handle Addressing (Byte vs Block)
+    uint32_t addr;
+    if (is_high_capacity) {
+        addr = sector;        // SDHC/SDXC: Block Address
     } else {
-        printf(" OK\n");
+        addr = sector * 512;  // SDSC: Byte Address
+    }
+
+    // 3. Send CMD18 (Read Multiple)
+    // We add CMD_AUTO_STOP so the Hardware Controller sends CMD12 automatically
+    // when BYCR countdown reaches 0.
+    uint32_t flags = CMD_RESP_EXP | CMD_CHECK_CRC | CMD_DATA_EXP | CMD_WAIT_PRE | CMD_AUTO_STOP;
+    
+    if (sd_send_cmd(CMD18, addr, flags) != 0) return -2;
+
+    // 4. Read Loop
+    uint32_t *buf_u32 = (uint32_t *)buffer;
+    int total_words = (512 * count) / 4;
+    int words_read = 0;
+    int timeout = 0xFFFFFF; // Larger timeout for multiple blocks
+
+    while (words_read < total_words && timeout--) {
+        // Check for Errors
+        if (H3_SD_MMC0->RISR & RISR_ERRORS) {
+            // Optional: Send manual CMD12 here if error occurs to reset card
+            return -3;
+        }
+
+        // Check FIFO Status
+        // Bit 2 of STAR register = FIFO Empty. We read if NOT empty.
+        if (!(H3_SD_MMC0->STAR & (1U << 2))) { 
+            buf_u32[words_read++] = H3_SD_MMC0->FIFO;
+        }
+    }
+
+    if (timeout <= 0) return -4; // Timeout
+
+    // 5. Wait for Data Over & Auto-Command Done
+    // Since we used Auto-Stop, we should technically wait for the specific Auto-Command done flag
+    // but waiting for DATA_OVER is usually sufficient for the data phase.
+    timeout = 0xFFFF;
+    while (!(H3_SD_MMC0->RISR & RISR_DATA_OVER) && timeout--) {
+         // Wait for controller to finish
     }
     
-    // 7. Check if card is still busy
-    timeout = 100000;
+    // Clear Interrupt Flags
+    H3_SD_MMC0->RISR = RISR_DATA_OVER | RISR_CMD_DONE;
+
+    return 0;
+}
+
+int sd_write_block(uint32_t sector, const uint8_t *buffer) {
+    // 1. Setup Block Size & Byte Count
+    H3_SD_MMC0->BKSR = 512;
+    H3_SD_MMC0->BYCR = 512;
+
+    // 2. Addressing (Inline logic since helper is removed)
+    uint32_t arg = sector;
+    if (!is_high_capacity) {
+        arg *= 512; // SDSC requires byte addressing
+    }
+
+    // 3. Send CMD24
+    // Flags: Response | Check CRC | Data Expected | Wait Pre-load | WRITE MODE
+    uint32_t flags = CMD_RESP_EXP | CMD_CHECK_CRC | CMD_DATA_EXP | CMD_WAIT_PRE | CMD_WRITE;
+    
+    if (sd_send_cmd(CMD24, arg, flags) != 0) return -1;
+
+    // 4. Write Loop
+    const uint32_t *buf_u32 = (const uint32_t *)buffer;
+    int words_to_write = 128; // 512 bytes / 4
+    int timeout = 0xFFFFF;
+
+    while (words_to_write > 0 && timeout--) {
+        // Check for Errors
+        if (H3_SD_MMC0->RISR & RISR_ERRORS) {
+            return -2;
+        }
+
+        // Check FIFO Status (Bit 3 in STAR usually indicates FIFO Full)
+        // If Bit 3 is 0, FIFO has space.
+        if (!(H3_SD_MMC0->STAR & (1U << 3))) { 
+            H3_SD_MMC0->FIFO = *buf_u32++;
+            words_to_write--;
+        }
+    }
+
+    if (timeout <= 0) return -3; // Write Timeout
+
+    // 5. Wait for Data Transfer Complete
+    timeout = 0xFFFFF;
+    while (!(H3_SD_MMC0->RISR & RISR_DATA_OVER) && timeout--) {
+        if (H3_SD_MMC0->RISR & RISR_ERRORS) return -4;
+    }
+
+    // Clear Flags
+    H3_SD_MMC0->RISR = RISR_DATA_OVER | RISR_CMD_DONE;
+
+    return (timeout > 0) ? 0 : -5;
+}
+
+int sd_write_blocks(uint32_t sector, int count, const uint8_t *buffer) {
+    if (count <= 0) return -1;
+    if (count == 1) return sd_write_block(sector, buffer); // Optimization
+
+    // 1. Setup Block Size & Total Byte Count
+    H3_SD_MMC0->BKSR = 512;
+    H3_SD_MMC0->BYCR = 512 * count; // Total bytes to write
+
+    // 2. Addressing (Inline logic)
+    uint32_t arg = sector;
+    if (!is_high_capacity) {
+        arg *= 512; // SDSC requires byte addressing
+    }
+
+    // 3. Send CMD25 (Write Multiple)
+    // Flags: Response | Check CRC | Data Exp | Wait Pre | WRITE | AUTO STOP
+    // CMD_AUTO_STOP (Bit 12) is crucial here! It tells the controller to 
+    // send CMD12 automatically when BYCR reaches 0.
+    uint32_t flags = CMD_RESP_EXP | CMD_CHECK_CRC | CMD_DATA_EXP | 
+                     CMD_WAIT_PRE | CMD_WRITE | CMD_AUTO_STOP;
+    
+    if (sd_send_cmd(CMD25, arg, flags) != 0) return -2;
+
+    // 4. Write Loop
+    const uint32_t *buf_u32 = (const uint32_t *)buffer;
+    int total_words = (512 * count) / 4;
+    int words_written = 0;
+    int timeout = 0xFFFFFF; // Larger timeout for multiple blocks
+
+    while (words_written < total_words && timeout--) {
+        // Check for Errors
+        if (H3_SD_MMC0->RISR & RISR_ERRORS) {
+            return -3;
+        }
+
+        // Check FIFO Status
+        // Bit 3 in STAR register = FIFO Full. 
+        // We write only if the FIFO is NOT full.
+        if (!(H3_SD_MMC0->STAR & (1U << 3))) { 
+            H3_SD_MMC0->FIFO = buf_u32[words_written++];
+        }
+    }
+
+    if (timeout <= 0) return -4; // Write Data Timeout
+
+    // 5. Wait for Auto-Stop and Data Complete
+    // We wait for DATA_OVER, which implies the Auto-CMD12 is also finished.
+    timeout = 0xFFFFF;
+    while (!(H3_SD_MMC0->RISR & RISR_DATA_OVER) && timeout--) {
+        if (H3_SD_MMC0->RISR & RISR_ERRORS) return -5;
+    }
+
+    // Clear Interrupt Flags
+    H3_SD_MMC0->RISR = RISR_DATA_OVER | RISR_CMD_DONE;
+
+    return (timeout > 0) ? 0 : -6;
+}
+
+int sd_erase_blocks(uint32_t start_sector, uint32_t count) {
+    if (count == 0) return 0;
+
+    // 1. Calculate End Address
+    // The Erase range is Inclusive (Start to End)
+    uint32_t end_sector = start_sector + count - 1;
+
+    // 2. Handle Addressing (Byte vs Block)
+    uint32_t arg_start = start_sector;
+    uint32_t arg_end   = end_sector;
+
+    if (!is_high_capacity) {
+        arg_start *= 512; // SDSC uses Byte Addressing
+        arg_end   *= 512;
+    }
+
+    // 3. Send CMD32 (Erase Start Address)
+    if (sd_send_cmd(CMD32, arg_start, CMD_RESP_EXP | CMD_CHECK_CRC) != 0) return -1;
+
+    // 4. Send CMD33 (Erase End Address)
+    if (sd_send_cmd(CMD33, arg_end, CMD_RESP_EXP | CMD_CHECK_CRC) != 0) return -2;
+
+    // 5. Send CMD38 (Execute Erase)
+    // Argument is ignored (0).
+    // The card will drive the DAT0 line LOW (Busy) after this command.
+    // We do NOT wait here manually. The next command you send will see 
+    // the busy line and wait automatically via the hardware's CMD_WAIT_PRE logic.
+    if (sd_send_cmd(CMD38, 0, CMD_RESP_EXP | CMD_CHECK_CRC) != 0) return -3;
+
+    return 0; // Erase command accepted successfully
+}
+
+uint32_t sd_get_status(void) {
+    // CMD13: Send Status (RCA is required)
+    if (sd_send_cmd(CMD13, rca << 16, CMD_RESP_EXP | CMD_CHECK_CRC) != 0) {
+        return 0xFFFFFFFF; // Error indicator
+    }
+    return H3_SD_MMC0->RESP0;
+}
+
+int sd_wait_ready(void) {
+    int timeout = 100000;
     while (timeout--) {
-        uint32_t status = MMCI_STATUS;
-        if (status & (1 << 8)) {  // DATAEND bit
-            break;
-        }
+        uint32_t status = sd_get_status();
+        if (status == 0xFFFFFFFF) return -1;
+
+        // Check "Current State" (Bits 9-12)
+        // 4 = TRAN (Transfer State) - Ready for data
+        uint32_t current_state = (status >> 9) & 0x0F;
+        if (current_state == 4) return 0;
     }
-    
-    // 8. Verify write with CMD13
-    printf("Verifying write...");
-    MMCI_CLEAR = 0xFFFFFFFF;
-    
-    // Wait a bit more for card to settle
-    for (volatile int i = 0; i < 5000; i++);
-    
-    if (sd_send_cmd(13, rca, 1) == 0) {
-        uint32_t card_status = MMCI_RESP0;
-        
-        // Check if card is ready and in transfer state
-        uint32_t current_state = (card_status >> 9) & 0xF;
-        printf(" Status: 0x%x (State: %x)\n", card_status, current_state);
-        
-        if ((card_status & (1 << 8)) && (current_state == 4)) {
-            printf("Card ready for data in transfer state\n");
-        } else {
-            printf("Card state/status unexpected\n");
-        }
-    } else {
-        printf(" Failed to get status\n");
-    }
-    
-    // 9. Cleanup
-    MMCI_DATACTRL = 0;  // Disable data controller
-    MMCI_CLEAR = 0xFFFFFFFF;  // Clear all status
-    
-    // 10. Reselect card to ensure we're in transfer state
-    sd_send_cmd(7, rca, 1);
-    
-    printf("Multiple write completed\n");
-    return (sectors_written == count) ? 0 : -1;
+    return -2; // Card stuck busy
+}
+
+int sd_set_bus_width_4bit(void) {
+    // 1. Send ACMD6 to Card
+    // (Remember: ACMD requires CMD55 first)
+    if (sd_send_cmd(CMD55, rca << 16, CMD_RESP_EXP | CMD_CHECK_CRC) != 0) return -1;
+    if (sd_send_cmd(ACMD6, 2, CMD_RESP_EXP | CMD_CHECK_CRC) != 0) return -2; // Arg 2 = 4-bit
+
+    // 2. Update Host Controller
+    H3_SD_MMC0->BWDR = 1; // 0=1-bit, 1=4-bit
+
+    return 0;
+}
+
+// 25000000 MHz
+int sd_set_speed(uint32_t frequency_hz) {
+    // 1. Disable Clock
+    H3_SD_MMC0->CKCR &= ~(1U << 16); 
+    sd_update_clock();
+
+    // 2. Calculate Divider (Simplified for H3)
+    // For 24MHz Source: Div=0 (Bypass) -> 24MHz output
+    // For 400kHz: Div=3 or 4
+    uint32_t div = 0; 
+    if (frequency_hz <= 400000) div = 4; // Slow speed
+
+    H3_SD_MMC0->CKCR = (1U << 16) | div; // Enable | Divider
+    return sd_update_clock();
 }

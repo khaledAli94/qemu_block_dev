@@ -1,20 +1,53 @@
 #include <uart.h>
-#include <stdarg.h> // Required for va_list
 
-void uart_init() {
-    UART0_CR = 0x0;        // Disable UART
-    UART0_LCRH = 0x70;     // Enable FIFO, 8-bit word length
-    UART0_CR = 0x301;      // Enable UART, TX enable, RX enable
-}
-
-char uart_getc(void)
+void sys_uart_init(void)
 {
-    return (char)(UART0_DR & 0xFF);
+    uint32_t val;
+
+    /* Enable UART0 clock gate */
+    val = *CCU_UART_GATE;
+    val |= (1 << 16);
+    *CCU_UART_GATE = val;
+
+    /* Deassert UART0 reset */
+    val = *CCU_UART_RESET;
+    val |= (1 << 16);
+    *CCU_UART_RESET = val;
+
+    /* Configure UART0: 115200 8N1 */
+    *UART_IER = 0x00;
+    *UART_FCR = 0xf7;
+    *(volatile uint32_t *)(UART0_BASE + 0x10) = 0x00;  // MCR
+
+    /* Enable DLAB */
+    val = *UART_LCR;
+    val |= (1 << 7);
+    *UART_LCR = val;
+
+    /* Set baud rate divisor (0x000D) */
+    *UART_DLL = 0x0d & 0xff;
+    *UART_DLH = (0x0d >> 8) & 0xff;
+
+    /* Disable DLAB */
+    val = *UART_LCR;
+    val &= ~(1 << 7);
+    *UART_LCR = val;
+
+    /* 8 data bits, no parity, 1 stop bit */
+    val = *UART_LCR;
+    val &= ~0x1f;
+    val |= (3 << 0);  // 8 bits
+    *UART_LCR = val;
 }
 
-void uart_putc(char c) {
-    while (UART0_FR & (1 << 5)); // Wait if TX FIFO full
-    UART0_DR = c;
+void sys_uart_putc(char c)
+{
+    *UART_THR = (uint32_t)c;
+}
+
+char sys_uart_getc(void)
+{
+    return (char)(*UART_RBR);
 }
 
 void sys_uart_puts(const char *str){
@@ -22,9 +55,12 @@ void sys_uart_puts(const char *str){
         return;
 
     while (*str) {
-        uart_putc(*str++);
+        sys_uart_putc(*str++);
     }
 }
+
+
+
 
 static void uart_put_uint(unsigned int val, int base)
 {
@@ -32,7 +68,7 @@ static void uart_put_uint(unsigned int val, int base)
     int i = 0;
 
     if (val == 0) {
-        uart_putc('0');
+        sys_uart_putc('0');
         return;
     }
 
@@ -43,8 +79,9 @@ static void uart_put_uint(unsigned int val, int base)
     }
 
     while (i--)
-        uart_putc(buf[i]);
+        sys_uart_putc(buf[i]);
 }
+
 
 int printf(const char *fmt, ...)
 {
@@ -54,7 +91,7 @@ int printf(const char *fmt, ...)
     while (*fmt) {
 
         if (*fmt != '%') {
-            uart_putc(*fmt++);
+            sys_uart_putc(*fmt++);
             continue;
         }
 
@@ -70,14 +107,14 @@ int printf(const char *fmt, ...)
 
         case 'c': {
             char c = (char)va_arg(ap, int);
-            uart_putc(c);
+            sys_uart_putc(c);
             break;
         }
 
         case 'd': {
             int v = va_arg(ap, int);
             if (v < 0) {
-                uart_putc('-');
+                sys_uart_putc('-');
                 v = -v;
             }
             uart_put_uint((unsigned)v, 10);
@@ -98,12 +135,12 @@ int printf(const char *fmt, ...)
         }
 
         case '%':
-            uart_putc('%');
+            sys_uart_putc('%');
             break;
 
         default:
-            uart_putc('%');
-            uart_putc(*fmt);
+            sys_uart_putc('%');
+            sys_uart_putc(*fmt);
             break;
         }
 
