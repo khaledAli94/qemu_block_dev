@@ -1,0 +1,39 @@
+# Prerequisites
+*.d
+
+# GCC files
+*.o
+*.obj
+*.su
+*.expand
+*.sym
+
+# Linker output
+
+*.map
+
+# Executables
+*.bin
+*.elf
+*.out
+*.hex
+
+*bootloader 
+
+# linux 
+*:Zone.Identifier 
+
+#unwanted
+*makefile
+info.md
+*.h_
+*.c_
+*.makefile
+*.img
+*.vscode
+capture_sdimg.md
+./src/sdhc.c
+./src/sdhc.h
+./src/malloc.c
+./src/malloc.h
+./src/lib1funcs.S
