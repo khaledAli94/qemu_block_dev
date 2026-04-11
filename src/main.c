@@ -45,10 +45,10 @@ int main(void) {
     uint8_t buf_read[512] __attribute__((aligned(32)));
     uint8_t buf_write[1024] __attribute__((aligned(32)));
 
-    printf("\r\n=== FAT32 BARE-METAL TEST SUITE ===\r\n");
+    printf("\r\n=== FAT BARE-METAL TEST SUITE ===\r\n");
 
     // 1. Mount Filesystem
-    printf("[1/4] Mounting FAT32...\r\n");
+    printf("[1/4] Mounting FAT...\r\n");
     res = fat_mount(&fs);
     if (res != 0) {
         printf("FAIL: Mount error code %d\r\n", res);
@@ -57,10 +57,11 @@ int main(void) {
     printf("PASS: Mounted. Root Cluster: %u\r\n", fs.root_cluster);
 
     // 2. Read short file name Test
-    char *sfn = "480X27~1.BMP";
-    printf("[2/4] Reading SFN %s\r\n", sfn);
+    char *fname = "480X27~1.BMP";
+    // char *filename = "480x272bmp24.bmp";
+    printf("[2/4] Reading SFN %s\r\n", fname);
     
-    res = fat_open(&fs, sfn, &file);
+    res = fat_open(&fs, fname, &file);
     if (res == 0) {
         printf("PASS: File Open. Size: %u bytes\r\n", file.size);
         
@@ -83,7 +84,7 @@ int main(void) {
         }
         fat_close(&fs, &file);
     } else {
-        printf("WARN: %s not found (Code %d). Skipping Read Test.\r\n", sfn, res);
+        printf("WARN: %s not found (Code %d). Skipping Read Test.\r\n", fname, res);
     }
 
     #if 0
